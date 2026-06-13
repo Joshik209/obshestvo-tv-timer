@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Общество · TV</title>
+<link rel="stylesheet" href="../src/ui/tv-style.css">
+<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+
+<!-- Табы -->
+<div class="tv-tabs">
+  <button class="tv-tab-btn" data-tab="seating" onclick="showTVTab('seating')">РАССАДКА</button>
+  <button class="tv-tab-btn" data-tab="timer"   onclick="showTVTab('timer')">ТАЙМЕР</button>
+</div>
+
+<!-- РАССАДКА -->
+<div class="tv-tab-content" id="tv-tab-seating">
+  <div id="tv-seating-status" class="tv-status-bar">● РАССАДКА · ПОДКЛЮЧЕНИЕ…</div>
+  <div id="tv-seating-content">
+    <div class="tv-seating-empty">РАССАДКА ЕЩЁ НЕ ГОТОВА</div>
+  </div>
+</div>
+
+<!-- ТАЙМЕР -->
+<div class="tv-tab-content" id="tv-tab-timer">
+  <div id="tv-timer-status" class="tv-status-bar">● ТАЙМЕР · ПОДКЛЮЧЕНИЕ…</div>
+  <div class="tv-club-name">ОБЩЕСТВО</div>
+  <div id="tv-registration" class="tv-registration"></div>
+  <div id="tv-phase-name" class="tv-phase-name">УРОВЕНЬ 1</div>
+  <div id="tv-timer-display" class="tv-timer-display">12:00</div>
+  <div id="tv-blinds" class="tv-blinds">100 / 100</div>
+  <div id="tv-ante" class="tv-ante" style="display:none"></div>
+  <div id="tv-next-level" class="tv-next-level"></div>
+  <div id="tv-running-status" class="tv-running-status" style="display:none">⏸ ПАУЗА</div>
+</div>
+
+<button id="btn-lite" onclick="toggleLiteMode()">LITE</button>
+
+<!-- ── SCRIPTS — порядок важен ────────────────────────────── -->
+<script src="../src/core/config.js"></script>
+<script src="../src/core/cloud-client.js"></script>
+<script src="../src/timer/structures.js"></script>
+<script src="../src/timer/timer-state.js"></script>
+<script src="../src/timer/timer-storage.js"></script>
+<script src="../src/timer/timer-cloud.js"></script>
+<script src="../src/timer/timer-engine.js"></script>
+<script src="../src/timer/timer-render-tv.js"></script>
+<script src="../src/seating/seating-state.js"></script>
+<script src="../src/seating/seating-storage.js"></script>
+<script src="../src/seating/seating-cloud.js"></script>
+<script src="../src/seating/seating-engine.js"></script>
+<script src="../src/seating/seating-render-tv.js"></script>
+<script src="../src/ui/tv-tabs.js"></script>
+
+<script>
+// ── TV INIT ─────────────────────────────────────────────────
+// TV = read-only. Только читает cloud. Никогда не пишет.
+
+const TV_CLOUD_INTERVAL = 15000;
+const TV_RENDER_INTERVAL = 1000;
+
+// Подключаем статус-элементы
+setTimerStatusElement(document.getElementById('tv-timer-status'));
+setSeatingStatusElement(document.getElementById('tv-seating-status'));
+
+// П.7: статус источника при старте
+(function setInitialStatus() {
+  const timerEl  = document.getElementById('tv-timer-status');
+  const seatEl   = document.getElementById('tv-seating-status');
+  if (!cloudIsEnabled()) {
+    if (timerEl) { timerEl.textContent = '● ТАЙМЕР · ЛОКАЛЬНЫЙ ТЕСТ'; timerEl.dataset.status = 'local'; }
+    if (seatEl)  { seatEl.textContent  = '● РАССАДКА · ЛОКАЛЬНЫЙ ТЕСТ'; seatEl.dataset.status = 'local'; }
+  }
+})();
+
+// Инициализация — TV не writer (false)
+initTimerEngine(false);
+initSeatingEngine(false);
+
+// Первый рендер из localStorage
+renderTimerTV(getTimerState());
+renderSeatingTV(getSeatingState());
+
+// Рендер таймера каждую секунду (только рисует — не меняет state)
+setInterval(function() {
+  var state = getTimerState();
+  if (state) renderTimerTV(state);
+}, TV_RENDER_INTERVAL);
+
+// Cloud sync — с jitter чтобы несколько TV не били одновременно
+var jitter = Math.floor(Math.random() * 7000);
+setTimeout(function() {
+  syncFromCloud();
+  setInterval(syncFromCloud, TV_CLOUD_INTERVAL);
+}, jitter);
+
+async function syncFromCloud() {
+  // Синхронизируем всегда — и mock (localStorage), и реальный cloud.
+  // При cloudEnabled:false cloudGet читает из localStorage mock,
+  // что позволяет вкладкам видеть друг друга на одном компьютере.
+  try {
+    var results = await Promise.allSettled([
+      loadCloudTimerState(),
+      loadCloudSeatingState()
+    ]);
+    if (results[0].status === 'fulfilled' && results[0].value) {
+      applyCloudTimerState(results[0].value);
+    }
+    if (results[1].status === 'fulfilled' && results[1].value) {
+      applyCloudSeatingState(results[1].value);
+    }
+  } catch(e) {
+    console.warn('[TV SYNC]', e.message);
+  }
+}
+
+// Восстановить вкладку и lite-режим
+restoreLiteMode();
+showTVTab(restoreLastTab());
+</script>
+</body>
+</html>

@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Общество · Рассадка</title>
+<link rel="stylesheet" href="../src/ui/admin-style.css">
+<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+
+<h1>УПРАВЛЕНИЕ РАССАДКОЙ</h1>
+
+<div id="admin-seating-sync" class="sync-bar">● ПОДКЛЮЧЕНИЕ…</div>
+
+<!-- Добавить игрока -->
+<div class="section">
+  <h2>ИГРОКИ</h2>
+  <div style="display:flex;gap:6px;margin-bottom:8px;">
+    <input type="text" id="input-player" placeholder="Имя игрока" maxlength="20"
+      onkeydown="if(event.key==='Enter')addPlayerToList()">
+    <button onclick="addPlayerToList()" class="btn-gold" style="white-space:nowrap;min-width:80px;">ДОБАВИТЬ</button>
+  </div>
+  <div id="admin-player-count" style="font-size:9px;color:var(--text3);letter-spacing:1px;margin-bottom:6px;">0 / 30</div>
+  <div id="admin-player-list" class="player-list">
+    <div class="admin-empty" style="font-size:10px;color:var(--text3);">Нет игроков</div>
+  </div>
+</div>
+
+<!-- Генерация рассадки -->
+<div class="section">
+  <h2>РАССАДКА</h2>
+  <label>Количество столов</label>
+  <select id="sel-tables">
+    <option value="1">1 стол (до 10)</option>
+    <option value="2">2 стола (до 20)</option>
+    <option value="3" selected>3 стола (до 30)</option>
+  </select>
+  <div class="btn-grid" style="margin-top:8px;">
+    <button class="btn-gold btn-full" onclick="generateAndSave()">🎲 СГЕНЕРИРОВАТЬ РАССАДКУ</button>
+    <button id="btn-final-table" onclick="toggleFinalTable()">🏆 Финальный стол</button>
+    <button onclick="clearAndSave()" class="btn-err">✕ ОЧИСТИТЬ</button>
+  </div>
+</div>
+
+<!-- Добавить опоздавшего -->
+<div class="section">
+  <h2>ОПОЗДАВШИЙ</h2>
+  <div style="display:flex;gap:6px;">
+    <select id="sel-late-player" style="flex:1;">
+      <option value="">— выбрать игрока —</option>
+    </select>
+    <button onclick="addLateToSeating()" class="btn-ok" style="white-space:nowrap;min-width:80px;">ДОБАВИТЬ</button>
+  </div>
+</div>
+
+<!-- Preview -->
+<div class="section">
+  <h2>РАССАДКА (PREVIEW)</h2>
+  <div id="admin-seating-preview" class="preview">Рассадка не создана</div>
+</div>
+
+<!-- ── SCRIPTS ────────────────────────────────────────────── -->
+<script src="../src/core/config.js"></script>
+<script src="../src/core/cloud-client.js"></script>
+<script src="../src/seating/seating-state.js"></script>
+<script src="../src/seating/seating-storage.js"></script>
+<script src="../src/seating/seating-cloud.js"></script>
+<script src="../src/seating/seating-engine.js"></script>
+<script src="../src/seating/seating-render-admin.js"></script>
+
+<script>
+// ── ADMIN SEATING INIT ───────────────────────────────────────
+// admin-seating.html — единственный writer рассадки
+
+setSeatingStatusElement(document.getElementById('admin-seating-sync'));
+
+// isWriter = true
+initSeatingEngine(true);
+initSeatingAdminEvents(); // делегирование кнопок удаления
+renderSeatingAdmin(getSeatingState());
+updateLatePlayerSelect();
+
+// Cloud sync при старте
+(async function() {
+  setSeatingCloudStatus('loading');
+  const cloudState = await loadCloudSeatingState();
+  if (cloudState) {
+    applyCloudSeatingState(cloudState);
+    renderSeatingAdmin(getSeatingState());
+  }
+  // null = cloud работает, просто seating-state ещё не создан — не offline
+})();
+
+// ── КНОПКИ ───────────────────────────────────────────────────
+
+function addPlayerToList() {
+  const input = document.getElementById('input-player');
+  const name = input.value.trim();
+  if (!name) return;
+  const state = getSeatingState();
+  if (state.players.includes(name)) { alert('Такой игрок уже есть'); return; }
+  if (state.players.length >= MAX_PLAYERS) { alert('Максимум ' + MAX_PLAYERS + ' игроков'); return; }
+  state.players.push(name);
+  state.updatedAt = new Date().toISOString();
+  saveLocalSeatingState(state);
+  if (_isSeatingWriter) saveCloudSeatingStateDebounced(state, 'add_player');
+  renderSeatingAdmin(state);
+  updateLatePlayerSelect();
+  input.value = '';
+  input.focus();
+}
+
+// Переопределяем removePlayerFromSeating для admin
+const _origRemove = removePlayerFromSeating;
+window.removePlayerFromSeating = function(name) {
+  _origRemove(name);
+  updateLatePlayerSelect();
+};
+
+function generateAndSave() {
+  const state = getSeatingState();
+  if (!state.players.length) { alert('Нет игроков'); return; }
+  const tableCount = parseInt(document.getElementById('sel-tables').value) || 3;
+  applySeating(state.players, tableCount);
+  updateLatePlayerSelect();
+}
+
+function clearAndSave() {
+  if (!confirm('Очистить рассадку?')) return;
+  clearSeating();
+  updateLatePlayerSelect();
+}
+
+function toggleFinalTable() {
+  const state = getSeatingState();
+  setFinalTable(!state.finalTable);
+}
+
+function addLateToSeating() {
+  const sel = document.getElementById('sel-late-player');
+  const name = sel.value;
+  if (!name) return;
+  const ok = addLatePlayer(name);
+  if (!ok) { alert('Нет свободных мест или игрок уже в рассадке'); return; }
+  sel.value = '';
+  updateLatePlayerSelect();
+}
+
+function updateLatePlayerSelect() {
+  const state = getSeatingState();
+  const allPlayers = (state && state.players) || [];
+  const seated = [];
+  if (state && state.tables) {
+    for (const t of state.tables) {
+      for (const s of t.seats) {
+        if (s.player) seated.push(s.player);
+      }
+    }
+  }
+  const available = allPlayers.filter(p => !seated.includes(p));
+  const sel = document.getElementById('sel-late-player');
+  sel.innerHTML = '<option value="">— выбрать игрока —</option>' +
+    available.map(p => '<option value="' + p.replace(/"/g,'&quot;') + '">' + p + '</option>').join('');
+}
+</script>
+</body>
+</html>
