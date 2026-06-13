@@ -1,36 +1,37 @@
 // ── TIMER ENGINE ───────────────────────────────────────────────
 // Единственный механизм автоперехода — scheduleAutoAdvance().
 // Render-функции НЕ меняют состояние.
+//
+// Модель:
+//   admin-timer.html = writer (source: 'admin', обновляет updatedAt)
+//   tv.html = reader  (source: 'tv-preview', НЕ обновляет updatedAt)
+//
+// Приоритет при merge:
+//   source:'admin' всегда побеждает source:'tv-preview'.
+//   Если source одинаковый — берём свежее updatedAt.
 
 let _timerState = null;
 let _autoAdvanceTimeout = null;
 let _autoPhaseLock = false;
-let _isAdminWriter = false; // только admin-timer.html пишет в cloud
+let _isAdminWriter = false;
 
-// Инициализация движка
 function initTimerEngine(isWriter) {
   _isAdminWriter = !!isWriter;
   _timerState = loadLocalTimerState() || createTimerState();
-  // Если таймер был запущен — пересчитываем scheduleAutoAdvance
   if (_timerState.running) scheduleAutoAdvance();
 }
 
-function getTimerState() {
-  return _timerState;
-}
+function getTimerState() { return _timerState; }
+function setTimerState(state) { _timerState = state; }
 
-function setTimerState(state) {
-  _timerState = state;
-}
-
-// ── ОПЕРАЦИИ ───────────────────────────────────────────────────
+// ── ОПЕРАЦИИ (только для admin-writer) ─────────────────────────
 
 function timerStart() {
   if (!_timerState || _timerState.running) return;
   _timerState.running = true;
   _timerState.startedAt = new Date().toISOString();
   _timerState.updatedAt = new Date().toISOString();
-  _timerState.source = 'local';
+  _timerState.source = 'admin';
   _persistTimerState('start');
   scheduleAutoAdvance();
 }
@@ -41,6 +42,7 @@ function timerPause() {
   _timerState.running = false;
   _timerState.startedAt = null;
   _timerState.updatedAt = new Date().toISOString();
+  _timerState.source = 'admin';
   cancelAutoAdvance();
   _persistTimerState('pause');
 }
@@ -48,14 +50,12 @@ function timerPause() {
 function timerNext() {
   if (!_timerState) return;
   const phases = getPhases(_timerState.structureId);
-  const newIdx = Math.min(phases.length - 1, _timerState.phaseIndex + 1);
-  _applyPhaseChange(newIdx, 'manual_next');
+  _applyPhaseChange(Math.min(phases.length - 1, _timerState.phaseIndex + 1), 'manual_next');
 }
 
 function timerPrev() {
   if (!_timerState) return;
-  const newIdx = Math.max(0, _timerState.phaseIndex - 1);
-  _applyPhaseChange(newIdx, 'manual_prev');
+  _applyPhaseChange(Math.max(0, _timerState.phaseIndex - 1), 'manual_prev');
 }
 
 function timerResetCurrentPhase() {
@@ -64,6 +64,7 @@ function timerResetCurrentPhase() {
   _timerState.remainingSec = _timerState.finalMode && phase.type==='level' ? 6*60 : phase.duration;
   _timerState.startedAt = _timerState.running ? new Date().toISOString() : null;
   _timerState.updatedAt = new Date().toISOString();
+  _timerState.source = 'admin';
   cancelAutoAdvance();
   _persistTimerState('reset_phase');
   if (_timerState.running) scheduleAutoAdvance();
@@ -73,7 +74,8 @@ function timerResetAll(structureId) {
   cancelAutoAdvance();
   _timerState = createTimerState({
     structureId: structureId || 'default',
-    updatedAt: new Date().toISOString()
+    updatedAt: new Date().toISOString(),
+    source: 'admin'
   });
   _persistTimerState('reset_all');
 }
@@ -83,7 +85,8 @@ function timerSetStructure(structureId) {
   cancelAutoAdvance();
   _timerState = createTimerState({
     structureId,
-    updatedAt: new Date().toISOString()
+    updatedAt: new Date().toISOString(),
+    source: 'admin'
   });
   _persistTimerState('structure_change:' + structureId);
 }
@@ -97,6 +100,7 @@ function timerSetFinalMode(enabled) {
     _timerState.startedAt = _timerState.running ? new Date().toISOString() : null;
   }
   _timerState.updatedAt = new Date().toISOString();
+  _timerState.source = 'admin';
   cancelAutoAdvance();
   _persistTimerState(enabled ? 'final_mode_on' : 'final_mode_off');
   if (_timerState.running) scheduleAutoAdvance();
@@ -114,13 +118,13 @@ function timerGoToLevel(level) {
 
 function _applyPhaseChange(newIdx, reason) {
   if (!_timerState) return;
-  const phases = getPhases(_timerState.structureId);
-  const phase = phases[newIdx];
+  const phase = getPhase(_timerState.structureId, newIdx);
   if (!phase) return;
   _timerState.phaseIndex = newIdx;
   _timerState.remainingSec = _timerState.finalMode && phase.type==='level' ? 6*60 : phase.duration;
   _timerState.startedAt = _timerState.running ? new Date().toISOString() : null;
   _timerState.updatedAt = new Date().toISOString();
+  _timerState.source = 'admin';
   cancelAutoAdvance();
   _persistTimerState(reason);
   if (_timerState.running) scheduleAutoAdvance();
@@ -128,31 +132,24 @@ function _applyPhaseChange(newIdx, reason) {
 
 function _persistTimerState(reason) {
   if (!_timerState) return;
-  // 1. local-first
   saveLocalTimerState(_timerState);
-  // 2. render сразу
   if (typeof renderTimerTV === 'function') renderTimerTV(_timerState);
   if (typeof renderTimerAdmin === 'function') renderTimerAdmin(_timerState);
-  // 3. cloud фоном — только writer
-  if (_isAdminWriter) {
-    saveCloudTimerStateDebounced(_timerState, reason);
-  }
+  if (_isAdminWriter) saveCloudTimerStateDebounced(_timerState, reason);
 }
 
 // ── AUTO-ADVANCE ──────────────────────────────────────────────
-// Единственный механизм перехода уровня.
 
 function scheduleAutoAdvance() {
   cancelAutoAdvance();
   if (!_timerState || !_timerState.running) return;
   const rem = getRemainingSec(_timerState);
   if (rem <= 0) {
-    // Уже 0 — переходим немедленно
     setTimeout(autoNextPhase, 100);
     return;
   }
   _autoAdvanceTimeout = setTimeout(autoNextPhase, rem * 1000);
-  console.log('[AUTO-ADVANCE] scheduled in', rem, 'sec');
+  console.log('[AUTO-ADVANCE] scheduled in', rem, 'sec, isWriter:', _isAdminWriter);
 }
 
 function cancelAutoAdvance() {
@@ -170,45 +167,92 @@ function autoNextPhase() {
   const phases = getPhases(_timerState.structureId);
   const currentIdx = _timerState.phaseIndex;
 
-  // Последняя фаза — останавливаем
   if (currentIdx >= phases.length - 1) {
+    // Последняя фаза
     _timerState.running = false;
     _timerState.startedAt = null;
     _timerState.remainingSec = 0;
-    _timerState.updatedAt = new Date().toISOString();
-    _persistTimerState('tournament_end');
+
+    if (_isAdminWriter) {
+      // Admin: официальное завершение с updatedAt
+      _timerState.updatedAt = new Date().toISOString();
+      _timerState.source = 'admin';
+      _persistTimerState('tournament_end');
+    } else {
+      // TV: только визуальное — НЕ меняем updatedAt и source
+      // Чтобы следующий cloud sync от admin мог перезаписать это
+      saveLocalTimerState(_timerState);
+      if (typeof renderTimerTV === 'function') renderTimerTV(_timerState);
+    }
+
     _autoPhaseLock = false;
     return;
   }
 
-  // Переходим на следующую фазу
+  // Переход на следующую фазу
   const nextIdx = currentIdx + 1;
   const nextPhase = phases[nextIdx];
   _timerState.phaseIndex = nextIdx;
   _timerState.remainingSec = _timerState.finalMode && nextPhase.type==='level' ? 6*60 : nextPhase.duration;
   _timerState.startedAt = new Date().toISOString();
-  _timerState.updatedAt = new Date().toISOString();
 
-  // local-first: сначала рендер
-  saveLocalTimerState(_timerState);
-  if (typeof renderTimerTV === 'function') renderTimerTV(_timerState);
-  if (typeof renderTimerAdmin === 'function') renderTimerAdmin(_timerState);
-
-  // cloud фоном — только writer
-  if (_isAdminWriter) saveCloudTimerStateDebounced(_timerState, 'auto_next');
+  if (_isAdminWriter) {
+    // Admin: официальный переход — обновляем updatedAt и source
+    _timerState.updatedAt = new Date().toISOString();
+    _timerState.source = 'admin';
+    // local-first: рендер сразу
+    saveLocalTimerState(_timerState);
+    if (typeof renderTimerTV === 'function') renderTimerTV(_timerState);
+    if (typeof renderTimerAdmin === 'function') renderTimerAdmin(_timerState);
+    // cloud фоном
+    saveCloudTimerStateDebounced(_timerState, 'auto_next');
+  } else {
+    // TV preview: НЕ меняем updatedAt — cloud от admin имеет приоритет
+    // Помечаем source:'tv-preview' чтобы merge знал что это локальный preview
+    _timerState.source = 'tv-preview';
+    // НЕ трогаем updatedAt!
+    saveLocalTimerState(_timerState);
+    if (typeof renderTimerTV === 'function') renderTimerTV(_timerState);
+    console.log('[TV PREVIEW] local advance to phase', nextIdx, '(updatedAt preserved)');
+  }
 
   _autoPhaseLock = false;
-  scheduleAutoAdvance(); // следующий
+  scheduleAutoAdvance();
 }
 
 // ── CLOUD REFRESH ─────────────────────────────────────────────
-// Вызывается при получении свежего state из cloud.
 
 function applyCloudTimerState(cloudState) {
   if (!cloudState) return;
+
+  // TV: защита от отката при tv-preview
+  if (!_isAdminWriter && _timerState) {
+    const cloudSrc = cloudState.source || '';
+    const localSrc = _timerState.source || '';
+
+    if (cloudSrc === 'admin' && localSrc === 'tv-preview') {
+      const lt = _timerState.updatedAt ? new Date(_timerState.updatedAt).getTime() : 0;
+      const ct = cloudState.updatedAt ? new Date(cloudState.updatedAt).getTime() : 0;
+
+      if (ct > lt) {
+        // Новая команда от админа (pause/start/next/reset) — принимаем
+        console.log('[TV] new admin command wins, phase:', cloudState.phaseIndex);
+        _timerState = cloudState;
+        saveLocalTimerState(_timerState);
+        cancelAutoAdvance();
+        if (typeof renderTimerTV === 'function') renderTimerTV(_timerState);
+        if (_timerState.running) scheduleAutoAdvance();
+      } else {
+        // Старый cloud — TV уже впереди локально, не откатываем
+        console.log('[TV] old cloud ignored, keeping tv-preview phase:', _timerState.phaseIndex);
+      }
+      return;
+    }
+  }
+
+  // Стандартный merge по updatedAt
   const merged = mergeTimerState(_timerState, cloudState);
-  if (merged === _timerState) return; // локальный выиграл — ничего не меняем
-  // Cloud свежее — применяем
+  if (merged === _timerState) return;
   _timerState = merged;
   saveLocalTimerState(_timerState);
   cancelAutoAdvance();
